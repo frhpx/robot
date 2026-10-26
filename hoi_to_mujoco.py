@@ -1,5 +1,5 @@
 """
-HOI pipeline 输出 -> MuJoCo G1 右手复现 (物体: 立方体, 或 object_asset.py 生成的真实形状 --object)
+HOI pipeline 输出 -> MuJoCo G1 右手复现 (物体: 立方体, 或 --object: object_points.py 的点云 / object_asset.py 的 mesh)
 
 输入: HOI-DETR 的 json (经 frames.FrameBoxes 分好左右手) + json 里的 hf 接触链接
 流程:
@@ -23,6 +23,7 @@ HOI pipeline 输出 -> MuJoCo G1 右手复现 (物体: 立方体, 或 object_ass
   python hoi_to_mujoco.py ... --video out.mp4 --src-video in.mp4   # 左: 原视频+检测框, 右: 机器人
   python hoi_to_mujoco.py ... --depth-npz moge.npz   # 用 MoGe 深度
   python hoi_to_mujoco.py ... --object assets/mug     # 用物体资产代替立方体
+  python hoi_to_mujoco.py ... --object assets/mug --obj-yaw 90   # 物体绕竖直轴转 90° (窄边对着抓握方向)
 """
 import argparse, os, sys, json, time
 import numpy as np
@@ -160,19 +161,27 @@ def to_robot(pc, onset):
 
 
 # ================= 3. 场景: G1 + 桌子 + 方块 =================
-def build_model(menagerie, obj_dir=None):
+def build_model(menagerie, obj_dir=None, obj_yaw=0.0):
     """G1 + 桌子 + 物体 (自由刚体, 有碰撞和重力) + 抓取焊接约束 (默认关闭)
-       obj_dir: object_asset.py 的输出目录; None = 立方体"""
+       obj_dir: object_points.py / object_asset.py 的输出目录; None = 立方体
+       obj_yaw: 物体绕竖直轴的初始转角 (rad)"""
     spec = mujoco.MjSpec.from_file(os.path.join(menagerie, "unitree_g1", "scene_with_hands.xml"))
     wb = spec.worldbody
     table = wb.add_body(name="table", pos=[OBJ_XY[0] + 0.05, -0.15, TABLE_TOP / 2])
     table.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=[0.15, 0.25, TABLE_TOP / 2], rgba=[0.6, 0.45, 0.3, 1])
-    obj = wb.add_body(name="obj", pos=OBJ_POS.tolist())
+    obj = wb.add_body(name="obj", pos=OBJ_POS.tolist(), quat=[np.cos(obj_yaw / 2), 0, 0, np.sin(obj_yaw / 2)])
     obj.add_freejoint(name="obj_joint")
+    meta = json.load(open(os.path.join(obj_dir, "meta.json"))) if obj_dir else None
     if obj_dir is None:
         obj.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=[CUBE_HALF] * 3, rgba=[0.9, 0.2, 0.2, 1], mass=CUBE_MASS)
+    elif meta.get("type") == "points":                                        # 点云: 每个点一个小球, 同一个刚体
+        pts = np.load(os.path.join(obj_dir, "points.npy"))
+        cols = np.load(os.path.join(obj_dir, "colors.npy"))
+        for p, c in zip(pts, cols):
+            obj.add_geom(type=mujoco.mjtGeom.mjGEOM_SPHERE, size=[meta["radius"], 0, 0], pos=p.tolist(),
+                         rgba=[*c.tolist(), 1], mass=meta["mass"] / len(pts),
+                         friction=[1.0, 0.01, 0.001])
     else:
-        meta = json.load(open(os.path.join(obj_dir, "meta.json")))
         spec.add_mesh(name="obj_vis", file=os.path.abspath(os.path.join(obj_dir, "mesh.obj")))
         obj.add_geom(type=mujoco.mjtGeom.mjGEOM_MESH, meshname="obj_vis", rgba=meta["rgba"],
                      contype=0, conaffinity=0, density=0)                     # 显示用, 不参与碰撞
@@ -197,7 +206,8 @@ def main():
     ap.add_argument("--video", default=None, help="离屏渲染到 mp4, 不开窗口")
     ap.add_argument("--src-video", default=None, help="和 json 对应的原视频; 给了就输出左右并排")
     ap.add_argument("--depth-npz", default=None, help="moge_depth.py 的输出; 不给就用框宽估深度")
-    ap.add_argument("--object", default=None, help="object_asset.py 生成的物体目录; 不给就用立方体")
+    ap.add_argument("--object", default=None, help="object_points.py / object_asset.py 生成的物体目录; 不给就用立方体")
+    ap.add_argument("--obj-yaw", type=float, default=0, help="物体绕竖直轴旋转 (度), 把窄边对着抓握方向")
     ap.add_argument("--no-weld", action="store_true", help="纯摩擦抓取: 拇指和手指碰到物体后不打开焊接约束")
     ap.add_argument("--cam-pitch", type=float, default=50, help="相机向下倾斜角 (度): 头戴约 50, 桌边侧拍约 15")
     args = ap.parse_args()
@@ -206,7 +216,11 @@ def main():
     global OBJ_POS, CAM_PITCH
     CAM_PITCH = np.deg2rad(args.cam_pitch)
     if args.object:                                    # 物体中心 = 桌面 + 半个物体高度
-        OBJ_POS = np.array([*OBJ_XY, TABLE_TOP + json.load(open(os.path.join(args.object, "meta.json")))["size"][2] / 2])
+        meta = json.load(open(os.path.join(args.object, "meta.json")))
+        OBJ_POS = np.array([*OBJ_XY, TABLE_TOP + meta["size"][2] / 2])
+        if "cam_pitch" in meta and abs(meta["cam_pitch"] - args.cam_pitch) > 1e-6:
+            print(f"警告: 物体资产是按 --cam-pitch {meta['cam_pitch']} 生成的, 现在用的是 {args.cam_pitch}, "
+                  "物体的朝向会不一致")
     box, contact, W, H, fps, fb = load_right_hand(args.hoi_json, hoi_repo)
     segs = segments(contact)
     if args.list or not segs:
@@ -225,7 +239,7 @@ def main():
     in_contact = np.zeros(b - a, bool); in_contact[s - a:e - a] = True
     print(f"seg {si}: frame {s}-{e}, 回放 {a}-{b}")
 
-    m = build_model(args.menagerie, args.object)
+    m = build_model(args.menagerie, args.object, np.deg2rad(args.obj_yaw))
     d = mujoco.MjData(m)            # 物理仿真
     dk = mujoco.MjData(m)           # IK 试算 (只做运动学)
     qa = [m.joint(n).qposadr[0] for n in ARM]
@@ -317,7 +331,7 @@ def main():
     def reset():
         mujoco.mj_resetData(m, d)
         d.qpos[:7] = BASE; d.qpos[qa] = q_start
-        d.qpos[obj_q:obj_q + 7] = [*OBJ_POS, 1, 0, 0, 0]
+        d.qpos[obj_q:obj_q + 7] = m.qpos0[obj_q:obj_q + 7]      # = OBJ_POS + --obj-yaw 的朝向
         d.eq_active[weld] = 0
         dk.qpos[:] = d.qpos
         mujoco.mj_forward(m, d)

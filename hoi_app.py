@@ -8,7 +8,8 @@
 先改下面的路径和 HOI_PY (装了 mmcv-full 的那个环境的 python).
 已经有 json 的话, 网页上直接一起上传, 会跳过 HOI-DETR.
 勾选 "MoGe 深度" 需要本环境装好 MoGe (见 moge_depth.py).
-填了物体名: assets/<物体名> 已存在就直接用, 不存在就先跑 object_asset.py 生成 (生成一次, 之后反复用).
+填了物体名: assets/<物体名> 已存在就直接用, 不存在就先生成 (生成一次, 之后反复用):
+  物体表示 = 点云 (默认) -> object_points.py (观测到的点云, 小球拼成的刚体); mesh -> object_asset.py (Hunyuan3D + CoACD).
 """
 import os, re, shutil, subprocess, sys, tempfile
 import gradio as gr
@@ -32,7 +33,7 @@ def run(cmd, cwd=None):
     return log
 
 
-def pipeline(video, hoi_json, seg, use_moge, obj_name, cam_pitch):
+def pipeline(video, hoi_json, seg, use_moge, obj_name, obj_kind, cam_pitch):
     if video is None:
         raise gr.Error("先上传视频")
     work = tempfile.mkdtemp(prefix="hoi_app_")
@@ -47,9 +48,9 @@ def pipeline(video, hoi_json, seg, use_moge, obj_name, cam_pitch):
         hoi_json = os.path.join(out_dir, "clip.json")
 
     # 2. 机器人复现
+    pitch = str(50 if cam_pitch is None else cam_pitch)
     base = [sys.executable, os.path.join(HERE, "hoi_to_mujoco.py"),
-            "--hoi-json", hoi_json, "--hoi-repo", HOI_REPO, "--menagerie", MENAGERIE,
-            "--cam-pitch", str(50 if cam_pitch is None else cam_pitch)]
+            "--hoi-json", hoi_json, "--hoi-repo", HOI_REPO, "--menagerie", MENAGERIE, "--cam-pitch", pitch]
     seg_log = run(base + ["--list"])
     log += seg_log
     if not re.search(r"seg \d+:", seg_log):
@@ -63,8 +64,9 @@ def pipeline(video, hoi_json, seg, use_moge, obj_name, cam_pitch):
     if obj_name:
         obj_dir = os.path.join(HERE, "assets", obj_name)
         if not os.path.exists(os.path.join(obj_dir, "meta.json")):
-            log += run([sys.executable, os.path.join(HERE, "object_asset.py"), "--video", video,
-                        "--hoi-json", hoi_json, "--hoi-repo", HOI_REPO, "--name", obj_name])
+            gen = [sys.executable, os.path.join(HERE, "object_asset.py" if obj_kind == "mesh" else "object_points.py"),
+                   "--video", video, "--hoi-json", hoi_json, "--hoi-repo", HOI_REPO, "--name", obj_name]
+            log += run(gen if obj_kind == "mesh" else gen + ["--cam-pitch", pitch])
         base += ["--object", obj_dir]
     out = os.path.join(work, "result.mp4")
     cmd = base + ["--video", out, "--src-video", video]
@@ -83,12 +85,13 @@ with gr.Blocks(title="HOI -> G1") as demo:
             seg = gr.Number(label="接触段编号 (-1 = 自动选最长)", value=-1, precision=0)
             use_moge = gr.Checkbox(label="MoGe 深度 (不勾选 = 用手框宽度估深度)", value=True)
             obj_name = gr.Textbox(label="物体名 (留空 = 立方体; 已有资产直接用, 没有就从视频生成)", value="")
+            obj_kind = gr.Radio(["点云", "mesh"], value="点云", label="物体表示 (生成新资产时用)")
             cam_pitch = gr.Number(label="相机下倾角 (度): 头戴约 50, 桌边侧拍约 15", value=50)
             btn = gr.Button("运行", variant="primary")
         with gr.Column():
             result = gr.Video(label="结果 (左: 原视频+检测框, 右: G1)")
             log = gr.Textbox(label="日志", lines=12)
-    btn.click(pipeline, [video, hoi_json, seg, use_moge, obj_name, cam_pitch], [result, log])
+    btn.click(pipeline, [video, hoi_json, seg, use_moge, obj_name, obj_kind, cam_pitch], [result, log])
 
 if __name__ == "__main__":
     import argparse
