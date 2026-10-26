@@ -91,5 +91,20 @@ with gr.Blocks(title="HOI -> G1") as demo:
     btn.click(pipeline, [video, hoi_json, seg, use_moge, obj_name, cam_pitch], [result, log])
 
 if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--host", default="127.0.0.1", help="0.0.0.0 = 允许局域网其他电脑访问")
+    ap.add_argument("--port", type=int, default=7860)
+    ap.add_argument("--share", action="store_true", help="生成 Gradio 临时公网链接 (72 小时), 必须配合登录密码")
+    ap.add_argument("--auth", default=os.environ.get("HOI_APP_AUTH"),
+                    help="登录账号密码, 格式 user:pass; 也可以用环境变量 HOI_APP_AUTH")
+    args = ap.parse_args()
+
+    if (args.host != "127.0.0.1" or args.share) and not args.auth:
+        raise SystemExit("对外开放时必须设置登录密码: --auth user:pass 或环境变量 HOI_APP_AUTH")
+    auth = tuple(args.auth.split(":", 1)) if args.auth else None
+
     os.environ.setdefault("MUJOCO_GL", "egl")      # 无窗口渲染
-    demo.launch()
+    demo.queue(default_concurrency_limit=1)        # 只有一张显卡: 一次只跑一个任务, 其余排队
+    demo.launch(server_name=args.host, server_port=args.port, share=args.share,
+                auth=auth, max_file_size="500mb")
