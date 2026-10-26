@@ -52,11 +52,36 @@ PAD = 30                   # 接触段前后各多放多少帧 (看到接近和�
 BASE = [0, 0, 0.793, 1, 0, 0, 0]
 ARM = ["right_shoulder_pitch_joint", "right_shoulder_roll_joint", "right_shoulder_yaw_joint",
        "right_elbow_joint", "right_wrist_roll_joint", "right_wrist_pitch_joint", "right_wrist_yaw_joint"]
-FINGERS = ["right_hand_thumb_0_joint", "right_hand_thumb_1_joint", "right_hand_thumb_2_joint",
-           "right_hand_index_0_joint", "right_hand_index_1_joint",
-           "right_hand_middle_0_joint", "right_hand_middle_1_joint"]
-F_CLOSED = np.array([0, 0.3, -0.8, 1.2, 1.2, 1.2, 1.2])   # 手指握紧的目标角度 (同 ik_grasp_drop.py)
-GRASP_OFFSET = np.array([0.12, 0.05, 0.0])  # 抓取点: 拇指和手指之间, 手腕坐标系 (同 ik_grasp_drop.py)
+HERE = os.path.dirname(os.path.abspath(__file__))
+# 手型配置: fingers = 主动关节 (有执行器); f_open / f_closed = 张开 / 握紧的目标角度; grasp_offset = 抓取点 (手腕系),
+# None = 启动时按 "手张开时拇指指尖和食指/中指指尖的中点" 从模型标定; thumb / others = 拇指 / 其他手指的 body (touching 用)
+HANDS = {
+    "dex3": dict(    # menagerie 的 G1 + Dex3 三指手
+        scene=lambda menagerie: os.path.join(menagerie, "unitree_g1", "scene_with_hands.xml"),
+        fingers=["right_hand_thumb_0_joint", "right_hand_thumb_1_joint", "right_hand_thumb_2_joint",
+                 "right_hand_index_0_joint", "right_hand_index_1_joint",
+                 "right_hand_middle_0_joint", "right_hand_middle_1_joint"],
+        f_open=np.zeros(7),
+        f_closed=np.array([0, 0.3, -0.8, 1.2, 1.2, 1.2, 1.2]),    # 同 ik_grasp_drop.py
+        grasp_offset=np.array([0.12, 0.05, 0.0]),                # 同 ik_grasp_drop.py
+        wrist="right_wrist_yaw_link",
+        thumb=[f"right_hand_thumb_{i}_link" for i in range(3)],
+        others=[f"right_hand_{f}_{i}_link" for f in ("index", "middle") for i in range(2)],
+        tips=None),
+    "inspire": dict(  # Unitree 官方 URDF 转换的 G1 + Inspire 五指手 (tools/urdf_to_mjcf.py)
+        scene=lambda menagerie: os.path.join(HERE, "models", "g1_inspire", "scene.xml"),
+        fingers=["R_thumb_proximal_yaw_joint", "R_thumb_proximal_pitch_joint", "R_index_proximal_joint",
+                 "R_middle_proximal_joint", "R_ring_proximal_joint", "R_pinky_proximal_joint"],
+        f_open=np.array([1.2, 0, 0, 0, 0, 0]),                   # 拇指先转到和四指相对 (对掌), 其余伸直
+        f_closed=np.array([1.2, 0.6, 1.7, 1.7, 1.7, 1.7]),
+        grasp_offset=None,
+        wrist="right_wrist_yaw_link",
+        thumb=["R_thumb_proximal", "R_thumb_intermediate", "R_thumb_distal"],
+        others=[f"R_{f}_{p}" for f in ("index", "middle", "ring", "pinky") for p in ("proximal", "intermediate")],
+        tips=("R_thumb_distal", "R_index_intermediate", "R_middle_intermediate")),
+}
+HAND = HANDS["inspire"]
+FINGERS, F_OPEN, F_CLOSED, GRASP_OFFSET = HAND["fingers"], HAND["f_open"], HAND["f_closed"], HAND["grasp_offset"]
 q0 = np.array([-0.4, 0, 0, 0.9, 0, 0, 0])
 
 
@@ -181,11 +206,56 @@ def to_robot(pc, onset):
 
 
 # ================= 3. 场景: G1 + 桌子 + 方块 =================
+def use_hand(name):
+    global HAND, FINGERS, F_OPEN, F_CLOSED, GRASP_OFFSET
+    HAND = HANDS[name]
+    FINGERS, F_OPEN, F_CLOSED, GRASP_OFFSET = HAND["fingers"], HAND["f_open"], HAND["f_closed"], HAND["grasp_offset"]
+
+
+def set_fingers(m, d, f):
+    """主动手指关节设成 f, 跟随关节按等式约束 (mimic) 一起设"""
+    for n, v in zip(FINGERS, f):
+        d.qpos[m.joint(n).qposadr[0]] = v
+    for e in range(m.neq):
+        if m.eq_type[e] == mujoco.mjtEq.mjEQ_JOINT:
+            c = m.eq_data[e]
+            q2 = d.qpos[m.jnt_qposadr[m.eq_obj2id[e]]]
+            d.qpos[m.jnt_qposadr[m.eq_obj1id[e]]] = c[0] + c[1] * q2 + c[2] * q2 ** 2 + c[3] * q2 ** 3 + c[4] * q2 ** 4
+
+
+def fingertip(m, d, body):
+    """指尖: 这个 body 的碰撞网格上离手掌 (腕部) 最远的顶点 (世界系)"""
+    hand = m.body(HAND["wrist"]).id
+    best, far = None, -1
+    for g in np.where(m.geom_bodyid == m.body(body).id)[0]:
+        if m.geom_type[g] != mujoco.mjtGeom.mjGEOM_MESH or m.geom_contype[g] == 0:
+            continue
+        mid = m.geom_dataid[g]
+        v = m.mesh_vert[m.mesh_vertadr[mid]:m.mesh_vertadr[mid] + m.mesh_vertnum[mid]]
+        w = d.geom_xpos[g] + v @ d.geom_xmat[g].reshape(3, 3).T
+        k = np.argmax(np.linalg.norm(w - d.xpos[hand], axis=1))
+        if np.linalg.norm(w[k] - d.xpos[hand]) > far:
+            best, far = w[k], np.linalg.norm(w[k] - d.xpos[hand])
+    return best
+
+
+def calibrate_grasp_offset(m):
+    """手张开时 拇指指尖 和 (食指 + 中指指尖)/2 的中点, 换算到腕部坐标系"""
+    d = mujoco.MjData(m)
+    d.qpos[:7] = BASE
+    set_fingers(m, d, F_OPEN)
+    mujoco.mj_kinematics(m, d)
+    th, ix, md = (fingertip(m, d, b) for b in HAND["tips"])
+    hand = m.body(HAND["wrist"]).id
+    p = (th + (ix + md) / 2) / 2
+    return d.xmat[hand].reshape(3, 3).T @ (p - d.xpos[hand])
+
+
 def build_model(menagerie, obj_dir=None, obj_yaw=0.0):
     """G1 + 桌子 + 物体 (自由刚体, 有碰撞和重力) + 抓取焊接约束 (默认关闭)
        obj_dir: object_points.py / object_asset.py 的输出目录; None = 立方体
        obj_yaw: 物体绕竖直轴的初始转角 (rad)"""
-    spec = mujoco.MjSpec.from_file(os.path.join(menagerie, "unitree_g1", "scene_with_hands.xml"))
+    spec = mujoco.MjSpec.from_file(HAND["scene"](menagerie))
     wb = spec.worldbody
     table = wb.add_body(name="table", pos=[OBJ_XY[0] + 0.05, -0.15, TABLE_TOP / 2])
     table.add_geom(type=mujoco.mjtGeom.mjGEOM_BOX, size=[0.15, 0.25, TABLE_TOP / 2], rgba=[0.6, 0.45, 0.3, 1])
@@ -210,7 +280,7 @@ def build_model(menagerie, obj_dir=None, obj_yaw=0.0):
             obj.add_geom(type=mujoco.mjtGeom.mjGEOM_MESH, meshname=f"obj_col{i}", group=3,
                          density=meta["density"])
     spec.add_equality(name="grasp", type=mujoco.mjtEq.mjEQ_WELD, objtype=mujoco.mjtObj.mjOBJ_BODY,
-                      name1="right_wrist_yaw_link", name2="obj", active=False)
+                      name1=HAND["wrist"], name2="obj", active=False)
     return spec.compile()
 
 
@@ -220,7 +290,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--hoi-json", default=os.path.join(here, "..", "HOI-pipeline-for-hand-detection", "data", "1.json"))
     ap.add_argument("--hoi-repo", default=None, help="frames.py 所在目录, 默认 = json 的上一级")
-    ap.add_argument("--menagerie", default=r"C:\Users\30691\mujoco_menagerie")
+    ap.add_argument("--menagerie", default=r"C:\Users\30691\mujoco_menagerie", help="只有 --hand dex3 需要")
+    ap.add_argument("--hand", default="inspire", choices=list(HANDS), help="inspire = G1 + Inspire 五指手 (models/), dex3 = menagerie 的三指手")
     ap.add_argument("--seg", type=int, default=None, help="复现第几段接触 (默认最长)")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--video", default=None, help="离屏渲染到 mp4, 不开窗口")
@@ -233,7 +304,8 @@ def main():
     args = ap.parse_args()
     hoi_repo = args.hoi_repo or os.path.dirname(os.path.dirname(os.path.abspath(args.hoi_json)))
 
-    global OBJ_POS, CAM_PITCH
+    global OBJ_POS, CAM_PITCH, GRASP_OFFSET
+    use_hand(args.hand)
     CAM_PITCH = np.deg2rad(args.cam_pitch)
     meta = scene = None
     if args.object:                                    # 物体中心 = 桌面 + 半个物体高度
@@ -271,6 +343,9 @@ def main():
     print(f"seg {si}: frame {s}-{e}, 回放 {a}-{b}")
 
     m = build_model(args.menagerie, args.object, np.deg2rad(args.obj_yaw))
+    if GRASP_OFFSET is None:
+        GRASP_OFFSET = calibrate_grasp_offset(m)
+        print(f"{args.hand}: 抓取点 (腕部系) = {np.round(GRASP_OFFSET, 3).tolist()}")
     d = mujoco.MjData(m)            # 物理仿真
     dk = mujoco.MjData(m)           # IK 试算 (只做运动学)
     qa = [m.joint(n).qposadr[0] for n in ARM]
@@ -280,12 +355,12 @@ def main():
     finger_act = [m.actuator(n).id for n in FINGERS]
     adof = m.jnt_dofadr[m.actuator_trnid[:, 0]]       # 每个电机对应的自由度 (重力补偿用)
     kp = m.actuator_gainprm[:, 0]
-    hand = m.body("right_wrist_yaw_link").id
+    hand = m.body(HAND["wrist"]).id
     obj = m.body("obj").id
     obj_q = m.joint("obj_joint").qposadr[0]
     weld = m.equality("grasp").id
-    thumb = {m.body(f"right_hand_thumb_{i}_link").id for i in range(3)}
-    finger = {m.body(f"right_hand_{f}_{i}_link").id for f in ("index", "middle") for i in range(2)}
+    thumb = {m.body(b).id for b in HAND["thumb"]}
+    finger = {m.body(b).id for b in HAND["others"]}
     n_sub = max(1, round(1 / (fps * m.opt.timestep)))  # 每个视频帧走几步物理
 
     def grasp_point(data):
@@ -362,12 +437,13 @@ def main():
     def reset():
         mujoco.mj_resetData(m, d)
         d.qpos[:7] = BASE; d.qpos[qa] = q_start
+        set_fingers(m, d, F_OPEN)
         d.qpos[obj_q:obj_q + 7] = m.qpos0[obj_q:obj_q + 7]      # = OBJ_POS + --obj-yaw 的朝向
         d.eq_active[weld] = 0
         dk.qpos[:] = d.qpos
         mujoco.mj_forward(m, d)
         for _ in range(10):                            # 先让物体在桌上落稳 (约 0.3 s)
-            step(q_start, np.zeros(len(FINGERS)))
+            step(q_start, F_OPEN)
 
     def run(show):
         reset()
@@ -393,7 +469,7 @@ def main():
                 if not in_contact[t]:
                     close = max(0.0, close - 1 / 8)    # 接触段结束: 张开
             ik(target)
-            f_target = close * F_CLOSED
+            f_target = F_OPEN + close * (F_CLOSED - F_OPEN)
             if held is not None:
                 if not in_contact[t]:                  # 松手: 关焊接, 物体交给物理
                     d.eq_active[weld] = 0; held = None
