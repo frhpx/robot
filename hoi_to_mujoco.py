@@ -6,7 +6,9 @@ HOI pipeline 输出 -> MuJoCo G1 右手复现 (物体: 立方体, 或 --object: 
   1. 每帧取右手框: 中心 (u, v) + 宽度 w
   2. 手的 3D 点 (相机系): 有 --depth-npz (moge_depth.py 输出) 就用 MoGe 的米制点图;
      否则用针孔反投影 d = f * HAND_WIDTH / w (手框越大离相机越近)
-  3. 相机 -> 机器人坐标: 头部相机向下倾斜 CAM_PITCH; 再平移, 使 "接触开始那一帧" 的手正好在方块上
+  3. 相机 -> 机器人坐标: 物体资产有 scene.json (object_points.py 用桌面平面估的相机姿态) 且有 --depth-npz 时,
+     手和物体用同一个 R_cam2table 转到桌面系, 再整体平移一次 (物体落在 OBJ_XY, 桌面 = TABLE_TOP), 保留真实相对位置;
+     否则 (后备): 头部相机向下倾斜 --cam-pitch, 再平移使 "接触开始那一帧" 的手正好在物体上
   4. 接触 (hf) 去抖 -> 抓取事件: 接触段内先让抓取点对准物体的实际位置, 到位后手指合拢,
      抓稳后跟随人手轨迹的相对运动; 接触段结束 -> 手指张开
   5. IK: 阻尼最小二乘 (位置 + 固定的抓取朝向) + 零空间姿态正则 + 关节速度限制 (保证手臂连续);
@@ -154,7 +156,25 @@ def cam_to_robot_R(a=None):
                      [0, -np.cos(a), -np.sin(a)]])
 
 
+def scene_shift(meta):
+    """桌面系 -> 世界系的平移: 物体底面中心落在 OBJ_XY, 桌面 (z = 0) 落在 TABLE_TOP"""
+    pose = np.array(meta["pose_table"])
+    return np.array([OBJ_XY[0] - pose[0], OBJ_XY[1] - pose[1], TABLE_TOP])
+
+
+def cam_to_world(pc, scene, meta):
+    """相机系点 -> 世界系, 用 scene.json 的桌面系 (和物体同一个变换)"""
+    R, p0 = np.array(scene["R_cam2table"]), np.array(scene["p_table"])
+    return (pc - p0) @ R.T + scene_shift(meta)
+
+
+def world_to_cam(p, scene, meta):
+    R, p0 = np.array(scene["R_cam2table"]), np.array(scene["p_table"])
+    return (p - scene_shift(meta)) @ R + p0
+
+
 def to_robot(pc, onset):
+    """后备 (没有 scene.json): --cam-pitch 旋转, 接触开始时的手平移到物体中心"""
     p = pc @ cam_to_robot_R().T
     p = p - p[onset] + OBJ_POS                        # 接触开始时抓取点 = 物体中心
     return smooth(np.clip(p, WS_LO, WS_HI))           # 先裁剪再平滑, 避免折线
@@ -215,9 +235,12 @@ def main():
 
     global OBJ_POS, CAM_PITCH
     CAM_PITCH = np.deg2rad(args.cam_pitch)
+    meta = scene = None
     if args.object:                                    # 物体中心 = 桌面 + 半个物体高度
         meta = json.load(open(os.path.join(args.object, "meta.json")))
         OBJ_POS = np.array([*OBJ_XY, TABLE_TOP + meta["size"][2] / 2])
+        sp = os.path.join(args.object, "scene.json")
+        scene = json.load(open(sp)) if os.path.exists(sp) and "pose_table" in meta else None
         if "cam_pitch" in meta and abs(meta["cam_pitch"] - args.cam_pitch) > 1e-6:
             print(f"警告: 物体资产是按 --cam-pitch {meta['cam_pitch']} 生成的, 现在用的是 {args.cam_pitch}, "
                   "物体的朝向会不一致")
@@ -231,7 +254,15 @@ def main():
     s, e = segs[si]
     a, b = max(0, s - PAD), min(len(box), e + PAD)
     pc = cam_points_from_moge(args.depth_npz, len(box)) if args.depth_npz else cam_points_from_box(box, W, H, s)
-    traj = to_robot(pc, s)[a:b]
+    if scene is not None and args.depth_npz:           # 真实相对位置: 手和物体同一个变换
+        pw = cam_to_world(pc, scene, meta)
+        print(f"桌面系 (scene.json, 隐含下倾角 {scene['pitch_deg']}°): 接触开始 (第 {s} 帧) 手到物体中心 "
+              f"{np.linalg.norm(pw[s] - OBJ_POS) * 100:.1f} cm")
+        traj = smooth(np.clip(pw, WS_LO, WS_HI))[a:b]
+    else:
+        if scene is not None:
+            print("没有 --depth-npz, 手轨迹没有米制深度: 退回 --cam-pitch + 接触时平移")
+        traj = to_robot(pc, s)[a:b]
     for t in range(s - a):                             # 接触前: 从上方接近物体
         dxy = np.linalg.norm(traj[t, :2] - OBJ_POS[:2])
         traj[t, 2] = max(traj[t, 2], OBJ_POS[2] + HOVER * np.clip((dxy - 0.005) / 0.02, 0, 1))

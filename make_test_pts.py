@@ -5,7 +5,7 @@
   python make_test_pts.py --mesh assets/mouse --name test_pts --cam-pitch 50
 
 相机方向 = cam_to_robot_R 第 3 列 (相机朝前的 z 轴) 反向; 只保留法向和它夹角 < 90° 的点 (不考虑自遮挡).
-桌面高度 = mesh 最低点.
+桌面 = mesh 最低点 (平移到 z = 0, 即桌面坐标系). 没有图像, 镜像补全不算冲突项.
 """
 import argparse, json, os
 import numpy as np
@@ -18,7 +18,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mesh", default=os.path.join(HERE, "assets", "mouse"), help="object_asset.py 的输出目录")
     ap.add_argument("--name", default="test_pts")
-    ap.add_argument("--cam-pitch", type=float, default=50, help="和之后 hoi_to_mujoco.py 的 --cam-pitch 一致")
+    ap.add_argument("--cam-pitch", type=float, default=50, help="合成相机的下倾角 (只用来挑看得到的表面点)")
+    ap.add_argument("--fill", default="mirror", choices=["mirror", "column"])
     ap.add_argument("--n-sample", type=int, default=20000)
     ap.add_argument("--voxel", type=float, default=0.007)
     ap.add_argument("--mass", type=float, default=0.1)
@@ -29,13 +30,13 @@ def main():
     p, face = trimesh.sample.sample_surface(mesh, args.n_sample, seed=0)
     to_cam = -cam_to_robot_R(np.deg2rad(args.cam_pitch))[:, 2]
     seen = mesh.face_normals[face] @ to_cam > 0
-    p = p[seen]
+    p = p[seen] - [0, 0, mesh.bounds[0, 2]]
     c = np.tile(meta["rgba"][:3], (len(p), 1))
     print(f"采样 {args.n_sample} 个表面点, 相机看得到 {len(p)} 个")
 
-    q, qc, r, size, voxel, yaw = build_cloud(p, c, float(mesh.bounds[0, 2]), args.voxel)
+    q, qc, r, size, voxel, pose, info = build_cloud(p, c, args.voxel, args.fill)
     out = os.path.join(HERE, "assets", args.name)
-    m = save_asset(out, q, qc, r, size, args.mass, meta.get("frame", -1), args.cam_pitch, voxel, yaw)
+    m = save_asset(out, q, qc, r, size, voxel, pose, args.mass, fill=args.fill, **info)
     print(f"saved {out}: {m['n']} 个点, 体素 {voxel * 1000:.1f} mm, 尺寸 {np.round(size * 100, 1).tolist()} cm "
           f"(mesh {np.round(np.array(meta['size']) * 100, 1).tolist()} cm)")
 
